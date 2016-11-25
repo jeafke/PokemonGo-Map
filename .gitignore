@@ -5,11 +5,14 @@
 *.sass-cache
 *.orig
 *.json
+accounts/
+logs/
 config/*
 !config/config.ini.example
 static/dist/
 node_modules/
 venv/
+vir/
 core
 src/
 _build
@@ -25,3 +28,11 @@ beehive.*
 !contrib/supervisord/gen-workers.sh
 !contrib/supervisord/install-reinstall.sh
 !static/data/*
+Test_DOS_Command.txt
+cli_helpfile.txt
+user_counter
+last_location
+go_launch.sh
+kill_tracker.sh
+kill_tracker_controle.sh
+launch.sh
