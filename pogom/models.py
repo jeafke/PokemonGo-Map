@@ -30,7 +30,7 @@ args = get_args()
 flaskDb = FlaskDB()
 cache = TTLCache(maxsize=100, ttl=60 * 5)
 
-db_schema_version = 9
+db_schema_version = 10
 
 
 class MyRetryDB(RetryOperationalError, PooledMySQLDatabase):
@@ -634,6 +634,7 @@ class WorkerStatus(BaseModel):
     fail = IntegerField()
     no_items = IntegerField()
     skip = IntegerField()
+    captchas = IntegerField(default=0)
     last_modified = DateTimeField(index=True)
     message = CharField(max_length=255)
 
@@ -759,10 +760,13 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue, a
     forts = None
     wild_pokemon = None
     pokesfound = False
+    nearbyfound = False
     fortsfound = False
 
     cells = map_dict['responses']['GET_MAP_OBJECTS']['map_cells']
     for cell in cells:
+        if len(cell.get('nearby_pokemons', [])) > 0:
+            nearbyfound = True
         if config['parse_pokemon']:
             if len(cell.get('wild_pokemons', [])) > 0:
                 pokesfound = True
@@ -961,6 +965,8 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue, a
     return {
         'count': skipped + stopsskipped + len(pokemons) + len(pokestops) + len(gyms),
         'gyms': gyms,
+        'nearby': nearbyfound,
+        'neargym': fortsfound,
     }
 
 
@@ -1277,4 +1283,9 @@ def database_migrate(db, old_ver):
         migrate(
             migrator.add_column('pokemon', 'last_modified', DateTimeField(null=True, index=True)),
             migrator.add_column('pokestop', 'last_updated', DateTimeField(null=True, index=True))
+        )
+
+    if old_ver < 10:
+        migrate(
+            migrator.add_column('workerstatus', 'captchas', IntegerField(default=0))
         )

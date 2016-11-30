@@ -253,13 +253,30 @@ class Pogom(Flask):
             return 'Location changes are turned off', 403
         # Part of query string.
         if request.args:
-            lat = request.args.get('lat', type=float)
-            lon = request.args.get('lon', type=float)
+            lat1 = request.args.get('lat', type=float)
+            lon1 = request.args.get('lon', type=float)
         # From post requests.
         if request.form:
-            lat = request.form.get('lat', type=float)
-            lon = request.form.get('lon', type=float)
-
+            lat1 = request.form.get('lat', type=float)
+            lon1 = request.form.get('lon', type=float)
+            
+        if len(args.limit_location_top_left) > 0 and len(args.limit_location_bottom_right) > 0:
+            lltl = args.limit_location_top_left.replace(" ", "")
+            lltl = lltl.replace('"', '')
+            llbr = args.limit_location_bottom_right.replace(" ", "")
+            llbr = llbr.replace('"', '')
+            lltl = lltl.split(",")
+            llbr = llbr.split(",")
+            if lat1 < float(lltl[0]) and lat1 > float(llbr[0]) and lon1 < float(llbr[1]) and lon1 > float(lltl[1]):
+                lat = lat1
+                lon = lon1
+                file_last_location = open('last_location', 'w')
+                file_last_location.write(str(lat) + ', ' + str(lon))
+                file_last_location.close()
+        else:
+            lat = lat1
+            lon = lon1
+        
         if not (lat and lon):
             log.warning('Invalid next location: %s,%s', lat, lon)
             return 'bad parameters', 400

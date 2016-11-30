@@ -27,7 +27,7 @@ import geopy.distance
 import requests
 
 from datetime import datetime
-from threading import Thread
+from threading import Thread, Lock
 from queue import Queue, Empty
 
 from pgoapi import PGoApi
@@ -47,14 +47,17 @@ log = logging.getLogger(__name__)
 
 TIMESTAMP = '\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000'
 
+loginDelayLock = Lock()
+
 
 # Apply a location jitter.
-def jitterLocation(location=None, maxMeters=10):
+def jitterLocation(location=None, maxMeters=13):
     origin = geopy.Point(location[0], location[1])
+    altitude = random.uniform(43.1,12.1)
     b = random.randint(0, 360)
     d = math.sqrt(random.random()) * (float(maxMeters) / 1000)
     destination = geopy.distance.distance(kilometers=d).destination(origin, b)
-    return (destination.latitude, destination.longitude, location[2])
+    return (destination.latitude, destination.longitude, altitude)
 
 
 # Thread to handle user input.
@@ -161,10 +164,10 @@ def status_printer(threadStatus, search_items_queue_array, db_updates_queue, wh_
                         proxylen = max(proxylen, len(str(threadStatus[item]['proxy_display'])))
 
             # How pretty.
-            status = '{:10} | {:5} | {:' + str(userlen) + '} | {:' + str(proxylen) + '} | {:7} | {:6} | {:5} | {:7} | {:10}'
+            status = '{:10} | {:5} | {:' + str(userlen) + '} | {:' + str(proxylen) + '} | {:7} | {:6} | {:5} | {:7} | {:8} | {:10}'
 
             # Print the worker status.
-            status_text.append(status.format('Worker ID', 'Start', 'User', 'Proxy', 'Success', 'Failed', 'Empty', 'Skipped', 'Message'))
+            status_text.append(status.format('Worker ID', 'Start', 'User', 'Proxy', 'Success', 'Failed', 'Empty', 'Skipped', 'Captchas', 'Message'))
             for item in sorted(threadStatus):
                 if(threadStatus[item]['type'] == 'Worker'):
                     current_line += 1
@@ -175,7 +178,7 @@ def status_printer(threadStatus, search_items_queue_array, db_updates_queue, wh_
                     if current_line > end_line:
                         break
 
-                    status_text.append(status.format(item, time.strftime('%H:%M', time.localtime(threadStatus[item]['starttime'])), threadStatus[item]['user'], threadStatus[item]['proxy_display'], threadStatus[item]['success'], threadStatus[item]['fail'], threadStatus[item]['noitems'], threadStatus[item]['skip'], threadStatus[item]['message']))
+                    status_text.append(status.format(item, time.strftime('%H:%M', time.localtime(threadStatus[item]['starttime'])), threadStatus[item]['user'], threadStatus[item]['proxy_display'], threadStatus[item]['success'], threadStatus[item]['fail'], threadStatus[item]['noitems'], threadStatus[item]['skip'], threadStatus[item]['captchas'], threadStatus[item]['message']))
 
         elif display_type[0] == 'failedaccounts':
             status_text.append('-----------------------------------------')
@@ -249,6 +252,7 @@ def worker_status_db_thread(threads_status, name, db_updates_queue):
                     'fail': status['fail'],
                     'no_items': status['noitems'],
                     'skip': status['skip'],
+                    'captchas': status['captchas'],
                     'last_modified': datetime.utcnow(),
                     'message': status['message']
                 }
@@ -345,6 +349,7 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb, db_updat
             'fail': 0,
             'noitems': 0,
             'skip': 0,
+            'captchas': 0,
             'user': '',
             'proxy_display': proxy_display,
             'proxy_url': proxy_url,
@@ -362,6 +367,9 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb, db_updat
 
     # A place to track the current location.
     current_location = False
+
+    # Create the appropriate type of scheduler to handle the search queue.
+    scheduler = schedulers.SchedulerFactory.get_scheduler(args.scheduler, [search_items_queue], threadStatus, args)
 
     # The real work starts here but will halt on pause_bit.set().
     while True:
@@ -496,13 +504,19 @@ def search_worker_thread(args, account_queue, account_failures, search_items_que
             status['user'] = account['username']
             log.info(status['message'])
 
-            stagger_thread(args, account)
+            # Delay each thread start time so that logins occur after delay.
+            loginDelayLock.acquire()
+            delay = args.login_delay + ((random.random() - .5) / 2)
+            log.debug('Delaying thread startup for %.2f seconds', delay)
+            time.sleep(delay)
+            loginDelayLock.release()
 
             # New lease of life right here.
             status['fail'] = 0
             status['success'] = 0
             status['noitems'] = 0
             status['skip'] = 0
+            status['captchas'] = 0
             status['location'] = False
             status['last_scan_time'] = 0
 
@@ -565,14 +579,41 @@ def search_worker_thread(args, account_queue, account_failures, search_items_que
                         continue
 
                 # Too late?
-                if leaves and now() > (leaves - args.min_seconds_left):
+                #if leaves and now() > (leaves - args.min_seconds_left):
+                extra_delay = check_speed_limit(args, status['location'], step_location, status['last_scan_time'])
+                continue_time = time.time() + extra_delay
+
+                if leaves and continue_time > (leaves - args.min_seconds_left):
                     search_items_queue.task_done()
                     status['skip'] += 1
-                    # It is slightly silly to put this in status['message'] since it'll be overwritten very shortly after. Oh well.
-                    status['message'] = 'Too late for location {:6f},{:6f}; skipping'.format(step_location[0], step_location[1])
+                    if time.time() > (leaves - args.min_seconds_left):
+                        status['message'] = 'Too late for location {:6f},{:6f}; skipping'.format(step_location[0], step_location[1])
+
+                    else:
+                        status['message'] = 'Skipping {:6f},{:6f}; outside time and speed constraints'.format(step_location[0], step_location[1])
                     log.info(status['message'])
                     # No sleep here; we've not done anything worth sleeping for. Plus we clearly need to catch up!
                     continue
+
+                # too fast?
+                if extra_delay:
+                    status['message'] = 'Too fast for {:6f},{:6f}; waiting {}s...'.format(step_location[0], step_location[1], extra_delay)
+                    log.info(status['message'])
+                    continue_time = time.time() + extra_delay
+                    #If time to travel is bigger than max-speed-limit-delay-switch, pause the current account and fetch a new from que
+                    if args.max_speed_limit_delay_switch > 0 and args.max_speed_limit_delay_switch < int(continue_time - time.time()):
+                        status['message'] = 'To far away {} is going to sleep.'.format(account['username'])
+                        log.info(status['message'])
+                        account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'rest interval'})
+                        break
+
+                    else:
+                        while time.time() < continue_time:
+                            time.sleep(1)
+                            remain = int(continue_time - time.time())
+                            if remain:
+                                status['message'] = 'Too fast for {:6f},{:6f}; waiting {}s...'.format(step_location[0], step_location[1], remain)
+
 
                 # Let the api know where we intend to be for this loop.
                 # Doing this before check_login so it does not also have to be done there
@@ -586,63 +627,83 @@ def search_worker_thread(args, account_queue, account_failures, search_items_que
                 status['message'] = 'Searching at {:6f},{:6f}'.format(step_location[0], step_location[1])
                 log.info(status['message'])
 
-                # Make the actual request. (finally!)
-                response_dict = map_request(api, step_location, args.jitter)
-
-                # G'damnit, nothing back. Mark it up, sleep, carry on.
-                if not response_dict:
-                    status['fail'] += 1
-                    consecutive_fails += 1
-                    status['message'] = 'Invalid response at {:6f},{:6f}, abandoning location'.format(step_location[0], step_location[1])
-                    log.error(status['message'])
-                    time.sleep(args.scan_delay)
-                    continue
-
-                # Got the response, check for captcha, parse it out, then send todo's to db/wh queues.
-                try:
-                    # Captcha check
-                    if args.captcha_solving:
-                        captcha_url = response_dict['responses']['CHECK_CHALLENGE']['challenge_url']
-                        if len(captcha_url) > 1:
-                            status['message'] = 'Account {} is encountering a captcha, starting 2captcha sequence'.format(account['username'])
-                            log.warning(status['message'])
-                            captcha_token = token_request(args, status, captcha_url)
-                            if 'ERROR' in captcha_token:
-                                log.warning("Unable to resolve captcha, please check your 2captcha API key and/or wallet balance")
-                                account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'catpcha failed to verify'})
-                                break
-                            else:
-                                status['message'] = 'Retrieved captcha token, attempting to verify challenge for {}'.format(account['username'])
-                                log.info(status['message'])
-                                response = api.verify_challenge(token=captcha_token)
-                                if 'success' in response['responses']['VERIFY_CHALLENGE']:
-                                    status['message'] = "Account {} successfully uncaptcha'd".format(account['username'])
-                                    log.info(status['message'])
-                                    # Make another request for the same coordinate since the previous one was captcha'd
-                                    response_dict = map_request(api, step_location, args.jitter)
-                                else:
-                                    status['message'] = "Account {} failed verifyChallenge, putting away account for now".format(account['username'])
-                                    log.info(status['message'])
+                retries = 0  # reset the retry counter
+                while retries < 3:
+                    # Make the actual request. (finally!)
+                    response_dict = map_request(api, step_location, args.jitter)
+    
+                    # G'damnit, nothing back. Mark it up, sleep, carry on.
+                    if not response_dict:
+                        status['fail'] += 1
+                        consecutive_fails += 1
+                        status['message'] = 'Invalid response at {:6f},{:6f}, abandoning location'.format(step_location[0], step_location[1])
+                        log.error(status['message'])
+                        time.sleep(args.scan_delay)
+                        continue
+    
+                    # Got the response, check for captcha, parse it out, then send todo's to db/wh queues.
+                    try:
+                        # Captcha check
+                        if args.captcha_solving:
+                            captcha_url = response_dict['responses']['CHECK_CHALLENGE']['challenge_url']
+                            if len(captcha_url) > 1:
+                                status['captchas'] += 1
+                                status['message'] = 'Account {} is encountering a captcha, starting 2captcha sequence'.format(account['username'])
+                                log.warning(status['message'])
+                                captcha_token = token_request(args, status, captcha_url)
+                                if 'ERROR' in captcha_token:
+                                    log.warning("Unable to resolve captcha, please check your 2captcha API key and/or wallet balance")
                                     account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'catpcha failed to verify'})
                                     break
-
-                    parsed = parse_map(args, response_dict, step_location, dbq, whq, api)
-                    search_items_queue.task_done()
-                    if parsed['count'] > 0:
-                        status['success'] += 1
-                        consecutive_empties = 0
-                    else:
-                        status['noitems'] += 1
-                        consecutive_empties += 1
-                    consecutive_fails = 0
-                    status['message'] = 'Search at {:6f},{:6f} completed with {} finds'.format(step_location[0], step_location[1], parsed['count'])
-                    log.debug(status['message'])
-                except KeyError:
-                    parsed = False
-                    status['fail'] += 1
-                    consecutive_fails += 1
-                    status['message'] = 'Map parse failed at {:6f},{:6f}, abandoning location. {} may be banned.'.format(step_location[0], step_location[1], account['username'])
-                    log.exception(status['message'])
+                                else:
+                                    status['message'] = 'Retrieved captcha token, attempting to verify challenge for {}'.format(account['username'])
+                                    log.info(status['message'])
+                                    response = api.verify_challenge(token=captcha_token)
+                                    if 'success' in response['responses']['VERIFY_CHALLENGE']:
+                                        status['message'] = "Account {} successfully uncaptcha'd".format(account['username'])
+                                        log.info(status['message'])
+                                        # Make another request for the same coordinate since the previous one was captcha'd
+                                        response_dict = map_request(api, step_location, args.jitter)
+                                    else:
+                                        status['message'] = "Account {} failed verifyChallenge, putting away account for now".format(account['username'])
+                                        log.info(status['message'])
+                                        account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'catpcha failed to verify'})
+                                        break
+    
+                        parsed = parse_map(args, response_dict, step_location, dbq, whq, api)
+                    
+                        if parsed['count'] > 0:
+                            status['success'] += 1
+                            consecutive_empties = 0
+                            search_items_queue.task_done()
+                            break
+                        else:
+                            if parsed['nearby']:
+                                status['success'] += 1
+                                consecutive_empties = 0
+                                search_items_queue.task_done()
+                                break
+                            else:
+                                retries += 1
+                                if retries >= 3:
+                                    status['noitems'] += 1
+                                    consecutive_empties += 1
+                                if parsed['neargym']:
+                                    status['message'] = 'Found a fort, but no pokemon. Either nothing around, or speed limited'
+                                else:
+                                    status['message'] = 'No nearby pokemon or forts. Either nothing around, or softbanned'
+                                    log.warning(status['message'])
+                                    time.sleep(args.scan_delay * retries)
+                                    continue  
+                        consecutive_fails = 0
+                        status['message'] = 'Search at {:6f},{:6f} completed with {} finds'.format(step_location[0], step_location[1], parsed['count'])
+                        log.debug(status['message'])
+                    except KeyError:
+                        parsed = False
+                        status['fail'] += 1
+                        consecutive_fails += 1
+                        status['message'] = 'Map parse failed at {:6f},{:6f}, abandoning location. {} may be banned.'.format(step_location[0], step_location[1], account['username'])
+                        log.exception(status['message'])
 
                 # Get detailed information about gyms.
                 if args.gym_info and parsed:
@@ -834,13 +895,24 @@ def calc_distance(pos1, pos2):
     return d
 
 
-# Delay each thread start time so that logins occur after delay.
-def stagger_thread(args, account):
-    if args.accounts.index(account) == 0:
-        return  # No need to delay the first one.
-    delay = args.accounts.index(account) * args.login_delay + ((random.random() - .5) / 2)
-    log.debug('Delaying thread startup for %.2f seconds', delay)
-    time.sleep(delay)
+def check_speed_limit(args, previous_location, next_location, last_scan_time):
+    if args.speed_limit > 0 and last_scan_time > 0:
+        move_distance = calc_distance(previous_location, next_location)
+        time_elapsed = time.time() - last_scan_time
+
+        if time_elapsed <= 0:
+            time_elapsed = 0.001
+        projected_speed = 3600.0 * move_distance / time_elapsed
+
+        if projected_speed > args.speed_limit:
+            extra_delay = int(move_distance / args.speed_limit * 3600.0 - time_elapsed) + 1
+
+            if args.max_speed_limit_delay and extra_delay > args.max_speed_limit_delay:
+                return args.max_speed_limit_delay
+            else:
+                return extra_delay
+
+    return 0
 
 
 class TooManyLoginAttempts(Exception):

@@ -68,6 +68,10 @@ def get_args():
                         help='Use beehive configuration for multiple accounts, one account per hex.  Make sure to keep -st under 5, and -w under the total amount of accounts available.', action='store_true', default=False)
     parser.add_argument('-l', '--location', type=parse_unicode,
                         help='Location, can be an address or coordinates.')
+    parser.add_argument('-lltl', '--limit-location-top-left', type=str,
+                        help='Top Left limit Location, limit scanning with this location as the top left corner of that square.')
+    parser.add_argument('-llbr', '--limit-location-bottom-right', type=str,
+                        help='Bottom Right limit Location, limit scanning with this location as the bottom right corner of that square.')
     parser.add_argument('-j', '--jitter', help='Apply random -9m to +9m jitter to location.',
                         action='store_true', default=False)
     parser.add_argument('-st', '--step-limit', help='Steps.', type=int,
@@ -196,6 +200,15 @@ def get_args():
                         help='Enable status page database update using STATUS_NAME as main worker name.')
     parser.add_argument('-spp', '--status-page-password', default=None,
                         help='Set the status page password.')
+    parser.add_argument('-sl', '--speed-limit',
+                        help='If next scan would cause the account to move above specified speed in kmph in a straight line, sleep until such time that it could reasonably move that distance.',
+                        type=int, default=0)
+    parser.add_argument('-msld', '--max-speed-limit-delay',
+                        help='Maximum time in seconds to delay when trying to stay under the speed limit, if delay is bigger it wil continue anyway.',
+                        type=int, default=0)
+    parser.add_argument('-mslds', '--max-speed-limit-delay-switch',
+                        help='Maximum time in seconds to delay when trying to stay under the speed limit, if delay is bigger it wil pause the account being used and switch to a new one from the que.',
+                        type=int, default=0)
     parser.add_argument('-el', '--encrypt-lib', help='Path to encrypt lib to be used instead of the shipped ones.')
     parser.add_argument('-odt', '--on-demand_timeout', help='Pause searching while web UI is inactive for this timeout(in seconds).', type=int, default=0)
     verbosity = parser.add_mutually_exclusive_group()
@@ -331,6 +344,12 @@ def get_args():
                 errors.append('The number of provided passwords ({}) must match the username count ({})'.format(num_passwords, num_usernames))
             if num_auths > 1 and num_usernames != num_auths:
                 errors.append('The number of provided auth ({}) must match the username count ({})'.format(num_auths, num_usernames))
+
+        if args.speed_limit < 0:
+            errors.append('Speed limit cannot be less than 0')
+
+        if args.max_speed_limit_delay < 0:
+            errors.append('Maximum delay due to speed limit cannot be less than 0')
 
         if len(errors) > 0:
             parser.print_usage()
